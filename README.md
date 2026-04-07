@@ -46,3 +46,12 @@ ninja -C build-debug
 ```
 
 **Run:** `./build/leakfinder /path/to/repo`
+
+# Contributing (Much appreciated!)
+
+I am developing this tool to solve the performance bottlenecks I encountered with other scanners.
+I specifically need help with:
+
+1. Refining Regex Patterns: If you are a regex pro, your help is needed to reduce false positives/negatives.
+2. Testing: Please try it on large codebases and report issues.
+3. Experienced C Developer: I have a 2 year full immersion experience with C, but I do not consider myself an expert.
