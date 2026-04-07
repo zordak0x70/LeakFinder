@@ -23,11 +23,11 @@ LeakFinder is written in pure C and optimized for performance. On the official G
 
 **LeakFinder in action:**
 
-![LeakFinder Benchmark]()
+![LeakFinder Benchmark](https://github.com/zordak0x70/LeakFinder/blob/main/assests/leakfinder.png)
 
 **gitleaks in action:**
 
-![gitleaks Benchmark]()
+![gitleaks Benchmark](https://github.com/zordak0x70/LeakFinder/blob/main/assests/gitleaks.png)
 ```
 
 # How to build the project
