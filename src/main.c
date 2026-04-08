@@ -1,4 +1,5 @@
 #include <git2/errors.h>
+#include <git2/types.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <immintrin.h>
@@ -34,11 +35,10 @@
 static atomic_long total_blobs_processed = 0;
 static atomic_long total_bytes_processed = 0;
 
-static inline int should_scan_blob(const git_blob *blob) {
+[[maybe_unused]] static inline int should_scan_blob(const git_blob *blob) { // This depends on optimizations for now
     size_t raw_size = git_blob_rawsize(blob);
-    const void *raw_content = git_blob_rawcontent(blob);
 
-    if (raw_size == 0 || raw_content == NULL) {
+    if (raw_size == 0) {
         return 0;
     }
 
@@ -64,7 +64,7 @@ typedef struct {
 MatchList global_matches;
 
 void matchlist_init(MatchList *list) {
-    list->capacity = MAX_GLOBAL_MATCHES; 
+    list->capacity = MAX_GLOBAL_MATCHES;
     list->items = malloc(sizeof(SecretMatch) * list->capacity);
 
     atomic_init(&list->count, 0);
@@ -105,6 +105,7 @@ typedef struct {
 
 typedef struct {
     git_repository *repo;
+    git_odb *odb;
     WorkQueue *queue;
     int worker_id;
 } WorkerArgs;
@@ -176,7 +177,7 @@ void queue_finish(WorkQueue *q) {
 
 void *worker_routine(void *arg) {
     WorkerArgs *warg = (WorkerArgs *)arg;
-    git_repository *repo = warg->repo;
+    git_odb *odb = warg->odb;
     WorkQueue *queue = warg->queue;
     [[maybe_unused]] int wid = warg->worker_id;
 
@@ -189,19 +190,29 @@ void *worker_routine(void *arg) {
 #endif
 
         for (int i = 0; i < batch.count; i++) {
-            git_blob *blob = NULL;
+            git_odb_object *obj = NULL;
 
-            if (git_blob_lookup(&blob, repo, &batch.blobs[i]) == 0) {
-                if (!should_scan_blob(blob)) {
-                    git_blob_free(blob);
-                    continue;
+            if (git_odb_read(&obj, odb, &batch.blobs[i]) != 0) {
+                continue; 
+            }
+
+            const char *raw_content = (const char *)git_odb_object_data(obj);
+            size_t raw_size = git_odb_object_size(obj);
+
+            int is_binary = 0;
+
+            if (raw_size > 0) {
+                size_t check_limit = (raw_size > 8192) ? 8192 : raw_size;
+                if (memchr(raw_content, '\0', check_limit) != NULL) {
+                    is_binary = 1;
                 }
+            } else {
+                is_binary = 1;
+            }
 
-                const void *raw_content = git_blob_rawcontent(blob);
-                size_t raw_size = git_blob_rawsize(blob);
-
+            if (!is_binary) {
                 size_t found = 0;
-                uint64_t *results = find_all_secrets((const char *)raw_content, raw_size, &found);
+                uint64_t *results = find_all_secrets(raw_content, raw_size, &found);
 
                 if (found > 0 && results != NULL) {
                     for (size_t f = 0; f < found; f++) {
@@ -209,12 +220,11 @@ void *worker_routine(void *arg) {
                             break;
                         }
                     }
-
                     free(results);
                 }
-
-                git_blob_free(blob);
             }
+
+            git_odb_object_free(obj);
         }
 
         total_blobs_processed += batch.count;
@@ -486,6 +496,12 @@ int main(int argc, char *argv[]) {
         return EXIT_FAILURE;
     }
 
+    git_odb *odb = NULL;
+    if (git_repository_odb(&odb, repo) < 0) {
+        fprintf(stderr, "[ERROR] Cannot open ODB\n");
+        return EXIT_FAILURE; 
+    }
+
     printf("[INFO] Blob Scanner starting (Target Batch: %dMB, Workers: %d)\n", TARGET_BATCH_MB, NUM_WORKERS);
 
     WorkQueue queue;
@@ -496,15 +512,13 @@ int main(int argc, char *argv[]) {
 
     for (int i = 0; i < NUM_WORKERS; i++) {
         args[i].repo = repo;
+        args[i].odb = odb;
         args[i].queue = &queue;
         args[i].worker_id = i;
         pthread_create(&workers[i], NULL, worker_routine, &args[i]);
     }
 
     time_t start_time = time(NULL);
-
-    git_odb *odb = NULL;
-    git_repository_odb(&odb, repo);
 
     OdbState state = {
         .queue = &queue,
