@@ -1,6 +1,7 @@
 #include <git2/errors.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <immintrin.h>
 #include <inttypes.h>
 #include <stddef.h>
 #include <string.h>
@@ -20,51 +21,20 @@
 #define MAX_OFFSETS_TO_PRINT 32
 #define MAX_GLOBAL_MATCHES 5000
 
-#define TARGET_BATCH_BYTES (500 * 1024 * 1024)
+#define TARGET_BATCH_MB 350
+#define TARGET_BATCH_BYTES (TARGET_BATCH_MB * 1024 * 1024)
 #define MAX_BLOBS_PER_BATCH 50000
-#define QUEUE_DEPTH 16
+#define QUEUE_DEPTH 20
 
 #define likely(x)   __builtin_expect(!!(x), 1)
 #define unlikely(x) __builtin_expect(!!(x), 0)
 
-typedef struct {
-    git_oid blob_id;
-    uint64_t offset;
-} SecretMatch;
-
-typedef struct {
-    SecretMatch *items;
-    size_t count;
-    size_t capacity;
-    pthread_mutex_t mutex;
-} MatchList;
-
-MatchList global_matches;
-
-typedef struct {
-    git_oid *blobs;
-    int count;
-    size_t total_bytes;
-    int batch_id;
-} WorkBatch;
-
-typedef struct {
-    WorkBatch items[QUEUE_DEPTH];
-    int head, tail, count;
-    int done_producing;
-    pthread_mutex_t mutex;
-    pthread_cond_t not_full, not_empty;
-} WorkQueue;
-
-typedef struct { git_repository *repo;
-    WorkQueue *queue;
-    int worker_id;
-} WorkerArgs;
+#define DEBUG false
 
 static atomic_long total_blobs_processed = 0;
 static atomic_long total_bytes_processed = 0;
 
-static inline int should_scan_blob(git_blob *blob) {
+static inline int should_scan_blob(const git_blob *blob) {
     size_t raw_size = git_blob_rawsize(blob);
     const void *raw_content = git_blob_rawcontent(blob);
 
@@ -79,89 +49,144 @@ static inline int should_scan_blob(git_blob *blob) {
     return 1;
 }
 
+typedef struct {
+    git_oid blob_id;
+    uint64_t offset;
+} SecretMatch;
+
+typedef struct {
+    SecretMatch *items;
+    _Atomic size_t count;
+    size_t capacity;        ///< No max capacity is intended, 
+                            ///< malloc can offload to disk using mmap on linux
+} MatchList;
+
+MatchList global_matches;
+
 void matchlist_init(MatchList *list) {
-    list->count = 0;
-    list->capacity = 128;
+    list->capacity = MAX_GLOBAL_MATCHES; 
     list->items = malloc(sizeof(SecretMatch) * list->capacity);
-    pthread_mutex_init(&list->mutex, NULL);
+
+    atomic_init(&list->count, 0);
 }
 
-int matchlist_add(MatchList *list, const git_oid *oid, uint64_t offset) {
-    pthread_mutex_lock(&list->mutex);
+inline int matchlist_add(MatchList *list, const git_oid *oid, uint64_t offset) {
+    size_t current_index = atomic_fetch_add_explicit(&list->count, 1, memory_order_relaxed);
 
-    if (unlikely(list->count >= MAX_GLOBAL_MATCHES)) {
-        pthread_mutex_unlock(&list->mutex);
-        return 0;
+    if (unlikely(current_index >= list->capacity)) {
+        return 0; 
     }
 
-    if (unlikely(list->count >= list->capacity)) {
-        list->capacity *= 2;
-        list->items = realloc(list->items, sizeof(SecretMatch) * list->capacity);
-    }
+    list->items[current_index].blob_id = *oid;
+    list->items[current_index].offset = offset;
 
-    list->items[list->count].blob_id = *oid;
-    list->items[list->count].offset = offset;
-    list->count++;
-
-    pthread_mutex_unlock(&list->mutex);
     return 1;
 }
 
 void matchlist_free(MatchList *list) {
     free(list->items);
-    pthread_mutex_destroy(&list->mutex);
 }
+
+typedef struct {
+    git_oid *blobs;
+    int count;
+    size_t total_bytes;
+    int batch_id;
+} WorkBatch;
+
+typedef struct {
+    WorkBatch items[QUEUE_DEPTH];
+
+    _Atomic size_t head;
+    _Atomic size_t tail;
+
+    _Atomic int done_producing;
+} WorkQueue;
+
+typedef struct {
+    git_repository *repo;
+    WorkQueue *queue;
+    int worker_id;
+} WorkerArgs;
 
 void queue_init(WorkQueue *q) {
     memset(q, 0, sizeof(*q));
-    pthread_mutex_init(&q->mutex, NULL);
-    pthread_cond_init(&q->not_full, NULL);
-    pthread_cond_init(&q->not_empty, NULL);
+    atomic_init(&q->head, 0);
+    atomic_init(&q->tail, 0);
+    atomic_init(&q->done_producing, 0);
+}
+
+static inline void cpu_relax(void) {
+    #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__)
+        _mm_pause();
+    #elif defined(__aarch64__) || defined(_M_ARM)
+        __asm__ volatile("yield" ::: "memory");
+    #elif defined(__riscv)
+        __asm__ volatile("nop" ::: "memory");
+    #else
+        // Nothing, just the while loop is fine
+    #endif
 }
 
 void queue_push(WorkQueue *q, WorkBatch batch) {
-    pthread_mutex_lock(&q->mutex);
-    while (q->count >= QUEUE_DEPTH) pthread_cond_wait(&q->not_full, &q->mutex);
-    q->items[q->tail] = batch;
-    q->tail = (q->tail + 1) % QUEUE_DEPTH;
-    q->count++;
-    pthread_cond_signal(&q->not_empty);
-    pthread_mutex_unlock(&q->mutex);
+    size_t current_tail = atomic_load_explicit(&q->tail, memory_order_relaxed);
+    size_t next_tail = (current_tail + 1) % QUEUE_DEPTH;
+
+    while (next_tail == atomic_load_explicit(&q->head, memory_order_acquire)) {
+        cpu_relax();
+        if (atomic_load(&q->done_producing)) return;
+    }
+
+    q->items[current_tail] = batch;
+
+    atomic_store_explicit(&q->tail, next_tail, memory_order_release);
 }
 
 int queue_pop(WorkQueue *q, WorkBatch *out) {
-    pthread_mutex_lock(&q->mutex);
-    while (q->count == 0 && !q->done_producing) pthread_cond_wait(&q->not_empty, &q->mutex);
-    if (q->count == 0 && q->done_producing) {
-        pthread_mutex_unlock(&q->mutex);
-        return 0;
+    while (1) {
+        size_t current_head = atomic_load_explicit(&q->head, memory_order_relaxed);
+        size_t current_tail = atomic_load_explicit(&q->tail, memory_order_acquire);
+
+        if (current_head == current_tail) {
+            if (atomic_load_explicit(&q->done_producing, memory_order_acquire)) {
+                return 0;
+            }
+            cpu_relax();
+            continue;
+        }
+
+        size_t next_head = (current_head + 1) % QUEUE_DEPTH;
+
+        if (atomic_compare_exchange_weak_explicit(
+                &q->head, 
+                &current_head,
+                next_head,
+                memory_order_acq_rel, 
+                memory_order_relaxed)) {
+
+            *out = q->items[current_head];
+            return 1;
+        }
     }
-    *out = q->items[q->head];
-    q->head = (q->head + 1) % QUEUE_DEPTH;
-    q->count--;
-    pthread_cond_signal(&q->not_full);
-    pthread_mutex_unlock(&q->mutex);
-    return 1;
 }
 
 void queue_finish(WorkQueue *q) {
-    pthread_mutex_lock(&q->mutex);
-    q->done_producing = 1;
-    pthread_cond_broadcast(&q->not_empty);
-    pthread_mutex_unlock(&q->mutex);
+    atomic_store_explicit(&q->done_producing, 1, memory_order_release);
 }
 
 void *worker_routine(void *arg) {
     WorkerArgs *warg = (WorkerArgs *)arg;
     git_repository *repo = warg->repo;
     WorkQueue *queue = warg->queue;
-    int wid = warg->worker_id;
+    [[maybe_unused]] int wid = warg->worker_id;
 
     WorkBatch batch;
 
     while (queue_pop(queue, &batch)) {
+#if DEBUG == true
         printf("[W%d] Processing batch %d (%d blobs, %.2f MB)\n", 
                wid, batch.batch_id, batch.count, batch.total_bytes / (1024.0 * 1024.0));
+#endif
 
         for (int i = 0; i < batch.count; i++) {
             git_blob *blob = NULL;
@@ -197,7 +222,9 @@ void *worker_routine(void *arg) {
         free(batch.blobs);
     }
 
+#if DEBUG
     printf("[W%d] Worker finished.\n", wid);
+#endif
     return NULL;
 }
 
@@ -222,7 +249,7 @@ int odb_iterator_cb(const git_oid *id, void *payload) {
     state->current_blobs[state->blob_count++] = *id;
     state->current_bytes += len;
 
-    if (state->current_bytes >= TARGET_BATCH_BYTES || state->blob_count >= MAX_BLOBS_PER_BATCH) {
+    if (state->current_bytes >= TARGET_BATCH_BYTES) {
         WorkBatch batch = {
             .blobs = state->current_blobs,
             .count = state->blob_count,
@@ -459,7 +486,7 @@ int main(int argc, char *argv[]) {
         return EXIT_FAILURE;
     }
 
-    printf("[INFO] Blob Scanner starting (Target Batch: 500MB, Workers: %d)\n", NUM_WORKERS);
+    printf("[INFO] Blob Scanner starting (Target Batch: %dMB, Workers: %d)\n", TARGET_BATCH_MB, NUM_WORKERS);
 
     WorkQueue queue;
     queue_init(&queue);
