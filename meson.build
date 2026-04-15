@@ -50,12 +50,17 @@ libgit2_dep = dependency('libgit2',
   version : '>=1.7.0'
 )
 
+vs_dep = dependency('libhs', required: false)
+if not vs_dep.found()
+    vs_dep = dependency('hs')
+endif
+
 executable(
     'leakfinder',
     src,
     c_args : c_args,
     link_args : link_args,
     include_directories : incdir,
-    dependencies : [libgit2_dep],
+    dependencies : [libgit2_dep, vs_dep],
     install : true
 )

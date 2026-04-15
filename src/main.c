@@ -1,6 +1,9 @@
 #include <git2/errors.h>
 #include <git2/types.h>
 #include <stdio.h>
+#include <hs/hs.h>
+#include <hs/hs_common.h>
+#include "default_regex.h"
 #include <stdlib.h>
 #include <immintrin.h>
 #include <inttypes.h>
@@ -12,10 +15,10 @@
 #include <git2.h>
 #include <stdbool.h>
 
+#include <hs/hs.h>
+
 #define STB_DS_IMPLEMENTATION
 #include "stb_ds.h"
-
-#include "secrets.h"
 
 #define NUM_WORKERS 8
 
@@ -27,26 +30,35 @@
 #define MAX_BLOBS_PER_BATCH 50000
 #define QUEUE_DEPTH 20
 
+#define MAX_CUSTOM_RULES 256
+
 #define likely(x)   __builtin_expect(!!(x), 1)
 #define unlikely(x) __builtin_expect(!!(x), 0)
 
-#define DEBUG false
+#define DEBUG true
 
 static atomic_long total_blobs_processed = 0;
 static atomic_long total_bytes_processed = 0;
 
-[[maybe_unused]] static inline int should_scan_blob(const git_blob *blob) { // This depends on optimizations for now
-    size_t raw_size = git_blob_rawsize(blob);
+static const char *custom_patterns[MAX_CUSTOM_RULES];
+static unsigned int custom_ids[MAX_CUSTOM_RULES];
+static int custom_rule_count = 0;
 
-    if (raw_size == 0) {
-        return 0;
+static const char *custom_rule_names[MAX_CUSTOM_RULES];
+static unsigned int custom_ids[MAX_CUSTOM_RULES];
+
+static inline bool should_scan_blob(const char *content, const size_t size) {
+    if (size == 0) {
+        return false;
     }
 
-    if (git_blob_is_binary(blob)) {
-        return 0;
+    const size_t check_limit = (size > 8192) ? 8192 : size;
+
+    if (memchr(content, '\0', check_limit) != NULL) {
+        return false;
     }
 
-    return 1;
+    return true;
 }
 
 typedef struct {
@@ -57,11 +69,365 @@ typedef struct {
 typedef struct {
     SecretMatch *items;
     _Atomic size_t count;
-    size_t capacity;        ///< No max capacity is intended, 
-                            ///< malloc can offload to disk using mmap on linux
+    size_t capacity;
 } MatchList;
 
 MatchList global_matches;
+
+static hs_database_t *g_hs_db = NULL;
+
+static hs_scratch_t *g_hs_scratch[NUM_WORKERS];
+
+static bool g_hs_initialized = false;
+
+typedef struct {
+    uint64_t *offsets;
+    size_t   *found_count;
+    size_t    capacity;
+} ScanContext;
+
+static int hs_event_handler(unsigned int id, 
+                            unsigned long long from,
+                            unsigned long long to, 
+                            unsigned int flags, 
+                            void *ctx) {
+    (void)id;
+    (void)from;
+    (void)flags;
+
+    ScanContext *sctx = (ScanContext *)ctx;
+
+    if (sctx->found_count[0] < sctx->capacity) {
+        sctx->offsets[sctx->found_count[0]] = (uint64_t)to;
+        sctx->found_count[0]++;
+    }
+
+    return 0;
+}
+
+static char *str_trim(char *s) {
+    while (*s == ' ' || *s == '\t') s++;
+    if (*s == '\0') return s;
+    char *end = s + strlen(s) - 1;
+    while (end > s && (*end == ' ' || *end == '\t')) end--;
+    *(end + 1) = '\0';
+    return s;
+}
+
+static char *extract_quoted_value(const char *line) {
+    const char *start = strchr(line, '"');
+    if (!start) return NULL;
+    start++;
+
+    const char *end = start;
+    size_t len = 0;
+    char *result;
+
+    while (*end) {
+        if (*end == '\\' && *(end + 1) == '"') {
+            len++;
+            end += 2;
+        } else if (*end == '"') {
+            break;
+        } else {
+            len++;
+            end++;
+        }
+    }
+
+    result = malloc(len + 1);
+    if (!result) return NULL;
+
+    const char *p = start;
+    char *r = result;
+    while (p < end) {
+        if (*p == '\\' && *(p + 1) == '"') {
+            *r++ = '"';
+            p += 2;
+        } else {
+            *r++ = *p++;
+        }
+    }
+    *r = '\0';
+
+    return result;
+}
+
+int load_custom_rules(const char *filepath) {
+    FILE *f = fopen(filepath, "r");
+    if (!f) {
+        fprintf(stderr, "[CONFIG ERROR] Cannot open config file: %s\n", filepath);
+        return -1;
+    }
+
+    char line[8192];
+    custom_rule_count = 0;
+
+    char *current_id = NULL;
+    char *current_regex = NULL;
+    int in_rule = 0;
+
+    int line_num = 0;
+
+    while (fgets(line, sizeof(line), f) != NULL && custom_rule_count < MAX_CUSTOM_RULES) {
+        line_num++;
+        char *trimmed = str_trim(line);
+
+        if (trimmed[0] == '\0' || trimmed[0] == '#' || trimmed[0] == ';') {
+            continue;
+        }
+
+        if (trimmed[0] == '[' && strstr(trimmed, "[[rules]]") == trimmed) {
+            if (in_rule && current_regex != NULL) {
+                if (current_id == NULL) {
+                    char auto_id[64];
+                    snprintf(auto_id, sizeof(auto_id), "custom-rule-%d", custom_rule_count);
+                    current_id = strdup(auto_id);
+                }
+
+                custom_patterns[custom_rule_count] = current_regex;
+                custom_rule_names[custom_rule_count] = current_id;
+                custom_ids[custom_rule_count] = DEFAULT_REGEX_COUNT + custom_rule_count;
+                custom_rule_count++;
+
+                printf("[CONFIG]   Added rule [%d]: id=\"%s\"\n", 
+                       custom_rule_count - 1, current_id);
+            }
+
+            in_rule = 1;
+            current_id = NULL;
+            current_regex = NULL;
+            continue;
+        }
+
+        char *eq = strchr(trimmed, '=');
+        if (eq && in_rule) {
+            *eq = '\0';
+            char *key = str_trim(trimmed);
+            char *value_str = str_trim(eq + 1);
+
+            if (strcmp(key, "id") == 0) {
+                free(current_id);  /* free previous if any */
+                current_id = extract_quoted_value(value_str);
+            } else if (strcmp(key, "regex") == 0) {
+                free(current_regex);  /* free previous if any */
+                current_regex = extract_quoted_value(value_str);
+            }
+        }
+    }
+
+    if (in_rule && current_regex != NULL && custom_rule_count < MAX_CUSTOM_RULES) {
+        if (current_id == NULL) {
+            char auto_id[64];
+            snprintf(auto_id, sizeof(auto_id), "custom-rule-%d", custom_rule_count);
+            current_id = strdup(auto_id);
+        }
+
+        custom_patterns[custom_rule_count] = current_regex;
+        custom_rule_names[custom_rule_count] = current_id;
+        custom_ids[custom_rule_count] = DEFAULT_REGEX_COUNT + custom_rule_count;
+        custom_rule_count++;
+
+        printf("[CONFIG]   Added rule [%d]: id=\"%s\"\n", 
+               custom_rule_count - 1, current_id);
+    }
+
+    fclose(f);
+
+    printf("[CONFIG] Loaded %d custom rules from %s\n", custom_rule_count, filepath);
+    return 0;
+}
+
+int hyperscan_init(void) {
+    if (g_hs_initialized) {
+        fprintf(stderr, "[HS] Already initialized\n");
+        return 0;
+    }
+
+    int total_rules = DEFAULT_REGEX_COUNT + custom_rule_count;
+
+    const char *patterns[DEFAULT_REGEX_COUNT + MAX_CUSTOM_RULES];
+    unsigned int flags[DEFAULT_REGEX_COUNT + MAX_CUSTOM_RULES];
+    unsigned int ids[DEFAULT_REGEX_COUNT + MAX_CUSTOM_RULES];
+    hs_compile_error_t *compile_err = NULL;
+    int rc;
+
+    for (int i = 0; i < DEFAULT_REGEX_COUNT; i++) {
+        patterns[i] = LEAK_RULE_REGEX(i);
+        flags[i] = HS_FLAG_DOTALL | HS_FLAG_ALLOWEMPTY | HS_FLAG_UTF8;
+        ids[i] = (unsigned int)i;
+    }
+
+    for (int i = 0; i < custom_rule_count; i++) {
+        patterns[DEFAULT_REGEX_COUNT + i] = custom_patterns[i];
+        flags[DEFAULT_REGEX_COUNT + i] = HS_FLAG_DOTALL | HS_FLAG_ALLOWEMPTY | HS_FLAG_UTF8;
+        ids[DEFAULT_REGEX_COUNT + i] = custom_ids[i];
+    }
+
+    printf("[HS] Compiling %d regex patterns (%d default + %d custom)...\n", 
+           total_rules, DEFAULT_REGEX_COUNT, custom_rule_count);
+
+    rc = hs_compile_multi(
+        patterns,
+        flags,
+        ids,
+        total_rules,
+        HS_MODE_BLOCK,
+        NULL,
+        &g_hs_db,
+        &compile_err
+    );
+
+    if (rc != HS_SUCCESS) {
+        fprintf(stderr, "[HS FATAL] Compilation failed with code %d\n", rc);
+        if (compile_err != NULL) {
+            fprintf(stderr, "[HS FATAL] Error: %s\n", compile_err->message);
+            if (compile_err->expression >= 0) {
+                int expr_idx = compile_err->expression;
+                fprintf(stderr, "[HS FATAL] Failed expression #%d", expr_idx);
+                if (expr_idx < DEFAULT_REGEX_COUNT) {
+                    fprintf(stderr, " (%s): %s\n",
+                            LEAK_RULE_ID(expr_idx),
+                            LEAK_RULE_REGEX(expr_idx));
+                } else {
+                    fprintf(stderr, " [CUSTOM]: %s\n", 
+                            custom_patterns[expr_idx - DEFAULT_REGEX_COUNT]);
+                }
+            }
+            hs_free_compile_error(compile_err);
+        }
+        return -1;
+    }
+
+    printf("[HS] Database compiled successfully (%d rules)\n", total_rules);
+
+    for (int i = 0; i < NUM_WORKERS; i++) {
+        rc = hs_alloc_scratch(g_hs_db, &g_hs_scratch[i]);
+        if (rc != HS_SUCCESS) {
+            fprintf(stderr, "[HS FATAL] Failed to allocate scratch for worker %d: %d\n", i, rc);
+
+            for (int j = 0; j < i; j++) {
+                hs_free_scratch(g_hs_scratch[j]);
+                g_hs_scratch[j] = NULL;
+            }
+            hs_free_database(g_hs_db);
+            g_hs_db = NULL;
+            return -1;
+        }
+    }
+
+    printf("[HS] Allocated %d scratch spaces (one per worker)\n", NUM_WORKERS);
+
+    g_hs_initialized = true;
+    return 0;
+}
+
+void hyperscan_free(void) {
+    if (!g_hs_initialized) return;
+
+    printf("[HS] Freeing resources...\n");
+
+    if (g_hs_db != NULL) {
+        hs_free_database(g_hs_db);
+        g_hs_db = NULL;
+    }
+
+    for (int i = 0; i < NUM_WORKERS; i++) {
+        if (g_hs_scratch[i] != NULL) {
+            hs_free_scratch(g_hs_scratch[i]);
+            g_hs_scratch[i] = NULL;
+        }
+    }
+
+    for (int i = 0; i < custom_rule_count; i++) {
+        free((void*)custom_patterns[i]);
+        custom_patterns[i] = NULL;
+    }
+    custom_rule_count = 0;
+
+    g_hs_initialized = false;
+    printf("[HS] Cleanup complete.\n");
+}
+
+uint64_t *find_all_secrets(const char *raw_content,
+                           size_t raw_size,
+                           size_t *found,
+                           int worker_id) {
+    const size_t INITIAL_CAPACITY = 32;
+    *found = 0;
+
+    if (raw_content == NULL || raw_size == 0 || found == NULL) {
+        return NULL;
+    }
+
+    if (worker_id < 0 || worker_id >= NUM_WORKERS) {
+        fprintf(stderr, "[HS ERROR] Invalid worker_id: %d\n", worker_id);
+        return NULL;
+    }
+
+    if (g_hs_db == NULL || g_hs_scratch[worker_id] == NULL) {
+        fprintf(stderr, "[HS ERROR] Hyperscan not initialized or invalid scratch[%d]\n", 
+                worker_id);
+        return NULL;
+    }
+
+    uint64_t *offsets = malloc(sizeof(uint64_t) * INITIAL_CAPACITY);
+    if (offsets == NULL) {
+        fprintf(stderr, "[HS ERROR] malloc failed for offsets\n");
+        return NULL;
+    }
+
+    ScanContext ctx = {
+        .offsets      = offsets,
+        .found_count  = found,
+        .capacity     = INITIAL_CAPACITY
+    };
+
+    hs_error_t err = hs_scan(
+        g_hs_db,
+        raw_content,
+        raw_size,
+        0,
+        g_hs_scratch[worker_id],
+        hs_event_handler,
+        &ctx
+    );
+
+    if (err != HS_SUCCESS && err != HS_SCAN_TERMINATED) {
+        fprintf(stderr, "[HS SCAN ERROR] Code %d on worker %d\n", err, worker_id);
+        free(offsets);
+        *found = 0;
+        return NULL;
+    }
+
+    if (*found == 0) {
+        free(offsets);
+        return NULL;
+    }
+
+    return offsets;
+}
+
+void hyperscan_print_info(void) {
+    if (!g_hs_initialized) {
+        printf("[HS] Status: NOT INITIALIZED\n");
+        return;
+    }
+
+    printf("[HS] Status: ACTIVE\n");
+    printf("[HS] Rules loaded: %d (%d default + %d custom)\n", 
+           DEFAULT_REGEX_COUNT + custom_rule_count, DEFAULT_REGEX_COUNT, custom_rule_count);
+    printf("[HS] Workers supported: %d\n", NUM_WORKERS);
+
+    for (int i = 0; i < DEFAULT_REGEX_COUNT; i++) {
+        printf("     - [%d] %s\n", i, LEAK_RULE_ID(i));
+    }
+
+    /* NEW: Print custom rule info */
+    for (int i = 0; i < custom_rule_count; i++) {
+        printf("     - [%d] [CUSTOM] %s\n", DEFAULT_REGEX_COUNT + i, custom_patterns[i]);
+    }
+}
 
 void matchlist_init(MatchList *list) {
     list->capacity = MAX_GLOBAL_MATCHES;
@@ -70,17 +436,24 @@ void matchlist_init(MatchList *list) {
     atomic_init(&list->count, 0);
 }
 
-inline int matchlist_add(MatchList *list, const git_oid *oid, uint64_t offset) {
-    size_t current_index = atomic_fetch_add_explicit(&list->count, 1, memory_order_relaxed);
+static inline int matchlist_add(MatchList *list, const git_oid *oid, uint64_t offset) {
+    while (1) {
+        size_t current_index = atomic_load_explicit(&list->count, memory_order_relaxed);
 
-    if (unlikely(current_index >= list->capacity)) {
-        return 0; 
+        if (unlikely(current_index >= list->capacity)) {
+            return 0;
+        }
+
+        size_t expected = current_index;
+        if (atomic_compare_exchange_strong_explicit(
+                &list->count, &expected, current_index + 1,
+                memory_order_acq_rel, memory_order_relaxed)) {
+
+            list->items[current_index].blob_id = *oid;
+            list->items[current_index].offset = offset;
+            return 1;
+        }
     }
-
-    list->items[current_index].blob_id = *oid;
-    list->items[current_index].offset = offset;
-
-    return 1;
 }
 
 void matchlist_free(MatchList *list) {
@@ -199,20 +572,11 @@ void *worker_routine(void *arg) {
             const char *raw_content = (const char *)git_odb_object_data(obj);
             size_t raw_size = git_odb_object_size(obj);
 
-            int is_binary = 0;
+            bool should_scan = should_scan_blob(raw_content, raw_size);
 
-            if (raw_size > 0) {
-                size_t check_limit = (raw_size > 8192) ? 8192 : raw_size;
-                if (memchr(raw_content, '\0', check_limit) != NULL) {
-                    is_binary = 1;
-                }
-            } else {
-                is_binary = 1;
-            }
-
-            if (!is_binary) {
+            if (should_scan) {
                 size_t found = 0;
-                uint64_t *results = find_all_secrets(raw_content, raw_size, &found);
+                uint64_t *results = find_all_secrets(raw_content, raw_size, &found, wid);
 
                 if (found > 0 && results != NULL) {
                     for (size_t f = 0; f < found; f++) {
@@ -227,8 +591,8 @@ void *worker_routine(void *arg) {
             git_odb_object_free(obj);
         }
 
-        total_blobs_processed += batch.count;
-        total_bytes_processed += batch.total_bytes;
+        atomic_fetch_add(&total_blobs_processed, batch.count);
+        atomic_fetch_add(&total_bytes_processed, batch.total_bytes);
         free(batch.blobs);
     }
 
@@ -274,34 +638,6 @@ int odb_iterator_cb(const git_oid *id, void *payload) {
     }
 
     return 0;
-}
-
-static int secretmatch_cmp(const void *a, const void *b) {
-    const SecretMatch *ma = (const SecretMatch *)a;
-    const SecretMatch *mb = (const SecretMatch *)b;
-
-    int rc = git_oid_cmp(&ma->blob_id, &mb->blob_id);
-    if (rc != 0) return rc;
-
-    if (ma->offset < mb->offset) return -1;
-    if (ma->offset > mb->offset) return 1;
-    return 0;
-}
-
-static void matchlist_sort_and_dedup(MatchList *list) {
-    if (list->count < 2) return;
-
-    qsort(list->items, list->count, sizeof(list->items[0]), secretmatch_cmp);
-
-    size_t w = 1;
-    for (size_t r = 1; r < list->count; r++) {
-        if (!git_oid_equal(&list->items[w - 1].blob_id, &list->items[r].blob_id) ||
-            list->items[w - 1].offset != list->items[r].offset) {
-            list->items[w++] = list->items[r];
-        }
-    }
-
-    list->count = w;
 }
 
 typedef struct {
@@ -353,15 +689,23 @@ int dict_tree_walk_cb(const char *root, const git_tree_entry *entry, void *paylo
 }
 
 void resolve_and_print_matches(git_repository *repo, FILE *out) {
-    if (repo == NULL || out == NULL || global_matches.count == 0) {
+    if (repo == NULL || out == NULL) return;
+
+    size_t safe_count = atomic_load_explicit(&global_matches.count, memory_order_acquire);
+
+    if (safe_count > global_matches.capacity) {
+        safe_count = global_matches.capacity;
+        fprintf(stderr, "[WARN] Iterating with clamped count: %zu\n", safe_count);
+    }
+
+    if (safe_count == 0) {
+        fprintf(out, "\n[INFO] No secrets found.\n");
         return;
     }
 
-    matchlist_sort_and_dedup(&global_matches);
-
     MatchDict *dict = NULL;
 
-    for (size_t i = 0; i < global_matches.count; i++) {
+    for (size_t i = 0; i < global_matches.capacity; i++) {
         git_oid current_oid = global_matches.items[i].blob_id;
 
         if (hmgeti(dict, current_oid) < 0) {
@@ -379,7 +723,6 @@ void resolve_and_print_matches(git_repository *repo, FILE *out) {
 
     git_revwalk *walker = NULL;
     if (git_revwalk_new(&walker, repo) == 0) {
-        // Push TUTTI i refs (heads, tags, remotes, notes, etc.)
         git_strarray ref_list;
         if (git_reference_list(&ref_list, repo) == 0) {
             for (size_t i = 0; i < ref_list.count; i++) {
@@ -434,9 +777,9 @@ void resolve_and_print_matches(git_repository *repo, FILE *out) {
     size_t orphans_count = 0;
     size_t resolved_count = 0;
 
-    while (i < global_matches.count) {
+    while (i < safe_count) {
         size_t j = i + 1;
-        while (j < global_matches.count &&
+        while (j < safe_count &&
                git_oid_equal(&global_matches.items[i].blob_id,
                              &global_matches.items[j].blob_id)) {
             j++;
@@ -481,17 +824,43 @@ void resolve_and_print_matches(git_repository *repo, FILE *out) {
     hmfree(dict); 
 }
 
+/* MODIFIED: Added -c option handling */
 int main(int argc, char *argv[]) {
-    if (argc != 2) {
-        fprintf(stderr, "Usage: %s <path/repo>\n", argv[0]);
+    const char *repo_path = NULL;
+    const char *config_file = NULL;
+
+    /* Parse arguments: either "./prog repo" or "./prog -c config repo" */
+    if (argc == 2) {
+        repo_path = argv[1];
+    } else if (argc == 4 && strcmp(argv[1], "-c") == 0) {
+        config_file = argv[2];
+        repo_path = argv[3];
+    } else {
+        fprintf(stderr, "Usage: %s [-c /path/to/config] <path/to/repo>\n", argv[0]);
         return EXIT_FAILURE;
     }
 
     git_libgit2_init();
     matchlist_init(&global_matches);
 
+    if (config_file != NULL) {
+        if (load_custom_rules(config_file) != 0) {
+            fprintf(stderr, "[FATAL] Failed to load config file\n");
+            return EXIT_FAILURE;
+        }
+    }
+
+    if (hyperscan_init() != 0) {
+        fprintf(stderr, "[FATAL] Hyperscan initialization failed\n");
+        return EXIT_FAILURE;
+    }
+
+#if DEBUG
+    hyperscan_print_info();
+#endif
+
     git_repository *repo = NULL;
-    if (git_repository_open(&repo, argv[1]) < 0) {
+    if (git_repository_open(&repo, repo_path) < 0) {
         fprintf(stderr, "[ERROR] Cannot open repository\n");
         return EXIT_FAILURE;
     }
@@ -552,6 +921,13 @@ int main(int argc, char *argv[]) {
         pthread_join(workers[i], NULL);
     }
 
+    size_t actual_count = atomic_load(&global_matches.count);
+    if (actual_count > global_matches.capacity) {
+        atomic_store(&global_matches.count, global_matches.capacity);
+        fprintf(stderr, "[WARN] Truncated matches from %zu to %zu\n", 
+                actual_count, global_matches.capacity);
+    }
+
     FILE* file = fopen("output_leak.txt", "w");
     if (!file) {
         fprintf(stderr, "[ERROR] Cannot open output_leak.txt for writing.\n");
@@ -566,7 +942,7 @@ int main(int argc, char *argv[]) {
     printf("\n========== RESULTS ==========\n");
     printf("Total Blobs Scanned     : %ld\n", (long)total_blobs_processed);
     printf("Total Data Scanned      : %.2f GB\n", total_bytes_processed / (1024.0 * 1024.0 * 1024.0));
-    printf("Total Secrets Found     : %zu\n", global_matches.count);
+    printf("Total Secrets Found     : %zu %s\n", global_matches.count, global_matches.count == MAX_GLOBAL_MATCHES ? "(Maximum)" : "");
     printf("Elapsed time            : %.1f seconds\n", elapsed);
     if (elapsed > 0) {
         printf("Throughput              : %.2f MB/sec\n", (total_bytes_processed / (1024.0*1024.0)) / elapsed);
@@ -574,6 +950,7 @@ int main(int argc, char *argv[]) {
     printf("==============================\n");
 
 clean:
+    hyperscan_free();
     git_odb_free(odb);
     if(file) fclose(file);
     git_repository_free(repo);

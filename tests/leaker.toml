@@ -1,0 +1,7 @@
+[[rules]]
+id = "my-custom-token"
+regex = "\\bMY_TOKEN_[A-Z0-9]{32}\\b"
+
+[[rules]]
+id = "password-assignment"
+regex = "password\\s*=\\s*[\"'][^\"']+[\"']"

@@ -1,5 +1,5 @@
 # **LeakFinder**
-Git secret scanner 9.2x faster than gitleaks. Forensic-grade scan of the entire object database (including unreachable objects).
+Git secret scanner 8.32x faster than gitleaks. Forensic-grade scan of the entire object database (including unreachable objects).
 
 ## Version & Development
 
@@ -12,13 +12,13 @@ I didn't even release the fully working beta...
 
 ## Benchmarks
 
-LeakFinder is written in pure C and optimized for performance. On the official Go repository, it achieves a scan speed of **73.44 MB/s**, making it approximately **9.3x faster** than gitleaks (7.84 MB/s).
+LeakFinder is written in pure C and optimized for performance. On the official Go repository, it achieves a scan speed of **65.26 MB/s**, making it approximately **8.32x faster** than gitleaks (7.84 MB/s).
 
 ### Performance Comparison
 
 | Tool | Language | Throughput | Relative Speed |
 | :--- | :---: | :---: | :---: |
-| **LeakFinder** | **C** | **73.44 MB/s** | **9.3x~ Faster** |
+| **LeakFinder** | **C** | **65.26 MB/s** | **8.32x~ Faster** |
 | gitleaks | Go | 7.84 MB/s | Baseline |
 
 **LeakFinder in action:**
@@ -41,7 +41,7 @@ ninja -C build
 
 **Debug:**
 ```bash
-meson setup build-debug --buildtype=debug  
+meson setup build-debug --buildtype=debug
 ninja -C build-debug
 ```
 
