@@ -1,4 +1,3 @@
-```markdown
 # TEST 1
 
 ## Prerequisites
@@ -51,4 +50,3 @@ Throughput              : 65.26 MB/sec
 ```
 
 **🎉 Happy testing!**
-```
